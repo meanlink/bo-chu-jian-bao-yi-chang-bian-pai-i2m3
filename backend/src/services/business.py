@@ -3,6 +3,7 @@ from datetime import date, timedelta
 import math
 import random
 import statistics
+from src.services.exemption_math import minutes_by_day, total_minutes, day_list
 
 
 def metadata():
@@ -49,7 +50,7 @@ def _parameter(value, name, low, high):
     return value
 
 
-def analyze(records, params):
+def analyze(records, params, exemptions=None):
     if not isinstance(records, list) or not records:
         raise ValueError("请先导入播控日记")
     channel = str(params.get("channel", "新闻一频"))
@@ -58,6 +59,7 @@ def analyze(records, params):
         raise ValueError("未知监测口径")
     smoothing = _parameter(params.get("smoothing", 0.2), "平滑系数", 0.05, 0.8)
     control_limit = _parameter(params.get("control_limit", 3), "控制限倍数", 2, 4)
+    exempt_by_day = minutes_by_day(exemptions or [], channel)
     parsed, days = [], set()
     consistency_warnings = 0
     for row in records:
@@ -75,26 +77,31 @@ def analyze(records, params):
         days.add(day)
         if abs(planned - aired - interruption) > 0.05:
             consistency_warnings += 1
-        value = aired / planned * 100 if metric == "completion" else interruption
-        parsed.append((day, value))
+        exempt = exempt_by_day.get(day.isoformat(), 0.0)
+        if exempt > interruption + 1e-9:
+            raise ValueError(f"{day.isoformat()} 的检修豁免 {exempt:g} 分钟超过原停播 {interruption:g} 分钟，拒绝扣除")
+        net_interruption = round(interruption - exempt, 6)
+        value = (planned - net_interruption) / planned * 100 if metric == "completion" else net_interruption
+        parsed.append((day, value, interruption, exempt, net_interruption))
     parsed.sort()
     if len(parsed) < 60:
         raise ValueError("所选链路至少需要60日，前30日作为固定基准")
     if any((parsed[index][0] - parsed[index-1][0]).days != 1 for index in range(1, len(parsed))):
         raise ValueError("EWMA要求连续日历，缺日请补充原始播控日记")
-    baseline_values = [value for _, value in parsed[:30]]
+    baseline_values = [value for _, value, *_ in parsed[:30]]
     mean = statistics.mean(baseline_values)
     sigma = statistics.stdev(baseline_values)
     if sigma < 1e-10:
         raise ValueError("基准期无波动，无法估计控制限；请换用已确认稳定且有波动的基准数据")
     z = mean
     output = []
-    for index, (day, value) in enumerate(parsed[30:], 1):
+    for index, (day, value, raw_interruption, exempt, net_interruption) in enumerate(parsed[30:], 1):
         z = smoothing * value + (1 - smoothing) * z
         half_width = control_limit * sigma * math.sqrt(smoothing / (2-smoothing) * (1-(1-smoothing)**(2*index)))
         lower, upper = mean-half_width, mean+half_width
         anomaly = z < lower or z > upper
-        output.append({"day": str(day), "actual": round(value, 4), "ewma": round(z, 4), "lower": round(lower, 4), "upper": round(upper, 4), "status": "越下限" if z < lower else "越上限" if z > upper else "受控", "anomaly": anomaly})
+        output.append({"day": str(day), "actual": round(value, 4), "ewma": round(z, 4), "lower": round(lower, 4), "upper": round(upper, 4), "status": "越下限" if z < lower else "越上限" if z > upper else "受控", "anomaly": anomaly,
+                       "original_interruption": round(raw_interruption, 4), "exempt_minutes": round(exempt, 4), "net_interruption": round(net_interruption, 4)})
     anomalies = [row for row in output if row["anomaly"]]
     unit = "%" if metric == "completion" else "分钟"
     latest = output[-1]
@@ -103,12 +110,21 @@ def analyze(records, params):
         warnings.append(f"有{consistency_warnings}行计划≠实播+停播，简报前需核对源日记口径。")
     if len(anomalies) > len(output) * 0.25:
         warnings.append("越限日超过监测期四分之一，需复核基准期或是否发生结构性变化。")
+    if exempt_by_day:
+        warnings.append(f"已按计划检修豁免扣除{len(exempt_by_day)}个播出日共{total_minutes(exempt_by_day):g}分钟；原停播分钟保留在明细中。")
     table_rows = [{key: value for key, value in row.items() if key != "anomaly"} for row in (anomalies[-25:] if anomalies else output[-14:])]
+    exemption_note = f"已扣除计划检修{total_minutes(exempt_by_day):g}分钟。" if exempt_by_day else ""
     return {
-        "summary": f"{channel}以{parsed[0][0]}至{parsed[29][0]}为固定基准；后续{len(output)}日中{len(anomalies)}日EWMA越限，最新日{latest['day']}为{latest['status']}。",
+        "summary": f"{channel}以{parsed[0][0]}至{parsed[29][0]}为固定基准；后续{len(output)}日中{len(anomalies)}日EWMA越限，最新日{latest['day']}为{latest['status']}。" + exemption_note,
         "metrics": [{"label": "基准均值", "value": round(mean, 4), "unit": unit}, {"label": "基准标准差", "value": round(sigma, 4), "unit": unit}, {"label": "越限日数", "value": len(anomalies), "unit": "日"}, {"label": "最新EWMA", "value": latest["ewma"], "unit": unit}],
-        "table": {"columns": [{"key": "day", "label": "播出日"}, {"key": "actual", "label": f"实测({unit})"}, {"key": "ewma", "label": "EWMA"}, {"key": "lower", "label": "下控制限"}, {"key": "upper", "label": "上控制限"}, {"key": "status", "label": "简报标记"}], "rows": table_rows},
+        "table": {"columns": [{"key": "day", "label": "播出日"}, {"key": "actual", "label": f"实测({unit})"}, {"key": "ewma", "label": "EWMA"}, {"key": "lower", "label": "下控制限"}, {"key": "upper", "label": "上控制限"}, {"key": "original_interruption", "label": "原停播(分钟)"}, {"key": "exempt_minutes", "label": "检修扣除(分钟)"}, {"key": "net_interruption", "label": "净停播(分钟)"}, {"key": "status", "label": "简报标记"}], "rows": table_rows},
         "chart": {"type": "line", "labels": [row["day"] for row in output], "series": [{"name": "EWMA", "values": [row["ewma"] for row in output]}, {"name": "下控制限", "values": [row["lower"] for row in output]}, {"name": "上控制限", "values": [row["upper"] for row in output]}]},
         "findings": [f"λ={smoothing:g}，L={control_limit:g}；基准固定30日，不使用未来监测值重新估计均值与标准差。", f"{'最近越限日为'+anomalies[-1]['day']+'，状态'+anomalies[-1]['status'] if anomalies else '本次未检测到越限日；仍应留存基准和参数'}。", "异常清单只展示最近25个越限日；无越限时展示最近14日，完整序列保留在图表数据。", "在分发模块选择本运行结果并设置计划；worker按实际时间投递至本地收件箱，分析函数不会发送消息。"],
         "method": metadata()["method"], "warnings": warnings,
+        "deduction": {
+            "total_minutes": total_minutes(exempt_by_day),
+            "days": day_list(exempt_by_day),
+            "original_total_minutes": round(sum(row[2] for row in parsed), 4),
+            "net_total_minutes": round(sum(row[4] for row in parsed), 4),
+        },
     }

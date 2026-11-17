@@ -1,6 +1,8 @@
-from sqlalchemy import String, Double, ForeignKey, Boolean
+from sqlalchemy import String, Double, JSON, Boolean, Integer, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 from src.config.database import Base
+
+
 class Report(Base):
     __tablename__ = 'reports'
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -10,6 +12,11 @@ class Report(Base):
     interval_seconds: Mapped[int]
     next_run: Mapped[float] = mapped_column(Double)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Frozen basis captured atapproval time; inherited by each delivery.
+    basis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    basis_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class Delivery(Base):
     __tablename__ = 'deliveries'
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -18,3 +25,6 @@ class Delivery(Base):
     checksum: Mapped[str] = mapped_column(String(64))
     filename: Mapped[str] = mapped_column(String(160))
     destination: Mapped[str] = mapped_column(String(120))
+    # Snapshot of the approved basis actually used for this file.
+    basis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    basis_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
